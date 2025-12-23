@@ -399,9 +399,7 @@ for r in present:
     # crisis - best AI weight
 
 
-# =========================
-# 8) BACKTEST DYNAMIC VS STATIC
-# =========================
+# BACKTEST DYNAMIC VS STATIC
 print("\nBacktesting strategy...")
 
 df["w_ai_dyn"] = df["regime_lag"].map(lambda r: alloc[r]["w_ai"])
@@ -410,9 +408,11 @@ df["w_tr_dyn"] = 1 - df["w_ai_dyn"]
 df["ret_dyn"] = df["w_ai_dyn"] * df["ret_ai"] + df["w_tr_dyn"] * df["ret_trad"]
 df["ret_static"] = 0.5 * df["ret_ai"] + 0.5 * df["ret_trad"]
 
-turnover_daily = df["w_ai_dyn"].diff().abs().dropna()
-total_turnover = turnover_daily.sum()
-annual_turnover = turnover_daily.mean() * TRADING_DAYS
+turnover_daily = df["w_ai_dyn"].diff().abs().dropna() #Daily turnover= |today weight − yesterday weight|
+total_turnover = turnover_daily.sum() #total turnover over all history
+annual_turnover = turnover_daily.mean() * TRADING_DAYS #average annual turnover
+
+# Higher turnover = more trading = more transaction cost impact
 
 perf_dyn = perf_summary(df["ret_dyn"].values, "Dynamic Regime Strategy")
 perf_sta = perf_summary(df["ret_static"].values, "Static 50/50 Benchmark")
@@ -430,14 +430,24 @@ print("\n=== Turnover (Dynamic) ===")
 print(f"Total turnover (sum |Δw_ai|): {total_turnover:.2f}")
 print(f"Approx annual turnover:       {annual_turnover:.2f}x")
 
+# we use perf_summary() which includes:
+	#   annual return
+	#	annual vol
+	#	Sortino
+	#	max drawdown
+	#	CVaR95
 
-# =========================
-# 9) PLOTS
-# =========================
+# it prints both dynamic and static for compaerison 
+
+
+# PLOTS
 print("\nPlotting cumulative returns and regime timeline...")
 
-cum_dyn = (1 + df["ret_dyn"]).cumprod()
+cum_dyn = (1 + df["ret_dyn"]).cumprod() # growth of $1 invested
 cum_sta = (1 + df["ret_static"]).cumprod()
+
+#Regime timeline:
+	#maps calm/stressed/crisis to 0/1/2 and plots
 
 plt.figure(figsize=(10, 5))
 plt.plot(cum_dyn.index, cum_dyn, label="Dynamic")
@@ -462,13 +472,14 @@ plt.tight_layout()
 plt.show()
 
 
-# =========================
-# 10) PRACTICAL INTERPRETATION
-# =========================
+# PRACTICAL INTERPRETATION
 print("\n=== Practical Interpretation ===")
 
 macro_cols = ["VIX", "sp500_ret_20d", "yield_slope_10y_3m", "credit_stress"]
 by_regime = df.groupby("regime_lag")[macro_cols].median().loc[present]
+
+# For each regime, show typical (median) VIX, 20-day S&P return, slope, credit stress
+#then prints a “rule of thumb” line and prints learned allocations
 
 print("\nMedian macro levels by regime (lagged):")
 print(by_regime)
@@ -482,3 +493,5 @@ for r in present:
     print(f"  {r.upper():8s}: AI {alloc[r]['w_ai']:.0%} / Traditional {1-alloc[r]['w_ai']:.0%}")
 
 print("\nDone.")
+
+
