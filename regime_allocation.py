@@ -1,0 +1,484 @@
+import warnings # non-fatal warnings (like “this will change in future versions”)
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.cluster import KMeans # clustering algorithm; groups days into regimes
+from sklearn.preprocessing import StandardScaler # normalizes features so one feature doesn’t dominate
+
+import yfinance as yf
+
+
+# =========================
+# CONFIG
+# =========================
+DATA_PATH = "ai_etf_downside_risk_data_full.xlsx"
+
+N_REGIMES = 3                      # calm / stressed / crisis
+TAIL_ALPHA = 0.95                  # CVaR at 95%: average loss on the worst 5% days
+WEIGHT_GRID_STEP = 0.1             # When choosing allocations, the script tries weights in steps of 10%: 0.0, 0.1, … 1.0
+TRADING_DAYS = 252
+
+MARKET_TICKER = "SPY"              # SPY represents the S&P 500. Used to compute a 20-day market return feature
+
+# Practical guideline threshold, not used for clustering, just printed as a human “rule of thumb”
+PRACTICAL_VIX_LEVEL = 25.0
+
+def cvar(returns, alpha=0.95): #define a function called cvar
+    r = np.asarray(returns) #convert returns into a numpy array
+    r = r[np.isfinite(r)] #Drop NaN and +- inf values.
+    if len(r) == 0:
+        return np.nan #if no usable returns exist, return NaN
+    r_sorted = np.sort(r) # sort returns from most negative to most positive
+    tail_n = int(np.ceil((1 - alpha) * len(r_sorted))) #if alpha=0.95, (1-alpha)=0.05 -> worst 5%
+    tail_n = max(tail_n, 1) #ceil ensures at least enough observations
+    return r_sorted[:tail_n].mean() # max(...,1) ensures at least 1 point
+
+def sortino_ratio(returns, rf=0.0): #define sortino function
+    r = np.asarray(returns) #convert to array and drop NaNs
+    r = r[np.isfinite(r)]
+    if len(r) < 5: 
+        return np.nan # too few points -> unreliable, return NaN
+    excess = r - rf # subtract risk-free rate (here rf=0, so basically unchanged)
+    downside = excess[excess < 0] #inly negative returnas
+    if len(downside) < 3:
+        return np.nan # if there aren’t enough negative points, downside volatility is not stable
+    ds = downside.std(ddof=1)
+    if ds == 0: #compute downside standard deviation and avoid dividing by zero
+        return np.nan
+    return excess.mean() / ds # Sortino = mean return / downside volatility
+
+def max_drawdown(returns): #define max drawdown function
+    r = np.asarray(returns)
+    r = r[np.isfinite(r)] #convert and clean
+    if len(r) == 0:
+        return np.nan # if empty return NaN 
+    equity = (1 + r).cumprod() #turn daily returns into a “portfolio value over time” starting from $1
+    peak = np.maximum.accumulate(equity) #running maximum: for each day, what was the highest value so far?
+    dd = (equity - peak) / peak # drawdown is how far below the peak you are (negative number)
+    return dd.min() # the most negative value is the worst drawdown
+
+def annualized_return(daily_returns, trading_days=252): # annual return using log/compounding
+    r = np.asarray(daily_returns) #log1p(r) = log(1+r) handles compounding properly; 
+    #multiply by 252 -> annual log return;exp(...) - 1 converts back to percent return
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return np.nan
+    return np.exp(np.log1p(r).mean() * trading_days) - 1
+
+def annualized_vol(daily_returns, trading_days=252):
+    r = np.asarray(daily_returns)
+    r = r[np.isfinite(r)]
+    if len(r) < 2:
+        return np.nan
+    return r.std(ddof=1) * np.sqrt(trading_days) # Vol scales with sqr(time)
+
+def perf_summary(returns, name): #Creates a dictionary of key stats used in output.
+	#Annual return
+	#Annual vol
+	#Sortino
+	#Max drawdown
+	#CVaR95
+    return {
+        "name": name,
+        "ann_return": annualized_return(returns, TRADING_DAYS),
+        "ann_vol": annualized_vol(returns, TRADING_DAYS),
+        "sortino": sortino_ratio(returns),
+        "max_drawdown": max_drawdown(returns),
+        "cvar_95": cvar(returns, TAIL_ALPHA),
+    }
+
+def find_sheet(xls, keywords, preferred=None):
+    sheets = xls.sheet_names
+    if preferred and preferred in sheets:
+        return preferred
+    for s in sheets:
+        low = s.lower()
+        if any(k in low for k in keywords):
+            return s
+    raise ValueError(f"Could not find a suitable sheet. Available sheets: {sheets}")
+# If “Daily_Returns” exists, it uses it, otherwise searches any sheet name containing "return"
+
+def find_col(df, keywords, preferred=None):
+    cols = list(df.columns)
+    if preferred and preferred in cols:
+        return preferred
+    for c in cols:
+        low = str(c).lower()
+        if any(k in low for k in keywords):
+            return c
+    return None
+#same idea but for columns (Date, Ticker, is_ai)
+
+print("Loading data from Excel...") 
+
+xls = pd.ExcelFile(DATA_PATH) # Opens the workbook
+
+returns_sheet = find_sheet(xls, keywords=["return"], preferred="Daily_Returns")
+funds_sheet   = find_sheet(xls, keywords=["fund", "summary", "meta", "info"], preferred="Fund_Summary")
+#finds sheet names
+
+daily = pd.read_excel(xls, returns_sheet)
+funds = pd.read_excel(xls, funds_sheet)
+# reads both sheets into pandas
+
+date_col = find_col(daily, keywords=["date"], preferred="Date")
+if date_col is None:
+    raise ValueError(f"No date-like column found in returns sheet. Columns: {daily.columns}")
+# finds Date column, if not found, stops
+daily[date_col] = pd.to_datetime(daily[date_col])
+daily = daily.sort_values(date_col).set_index(date_col)
+#convert to datetime, sort and make Date the index
+
+# keep only numeric columns (tickers), keep ETF return columns
+daily = daily.select_dtypes(include=[np.number])
+
+ticker_col = find_col(funds, keywords=["ticker"], preferred="Ticker")
+if ticker_col is None:
+    raise ValueError(f"No ticker-like column found in fund summary. Columns: {funds.columns}")
+
+ai_flag_col = find_col(funds, keywords=["is_ai", "ai"], preferred="is_ai")
+if ai_flag_col is None:
+    raise ValueError(f"No AI-flag column found in fund summary. Columns: {funds.columns}")
+#find ticker and AI flag columns
+
+funds[ticker_col] = funds[ticker_col].astype(str)
+#ensure tickers are strings to match return columns
+
+common = sorted(set(daily.columns).intersection(set(funds[ticker_col])))
+if len(common) == 0:
+    raise ValueError("No common tickers between daily returns and fund summary.")
+#only keep tickers found in both places
+
+daily = daily[common]
+#removes any return columns without metadata
+
+ai_tickers = funds.loc[funds[ai_flag_col] == True, ticker_col].tolist() # build lists based on is_ai
+trad_tickers = funds.loc[funds[ai_flag_col] == False, ticker_col].tolist()
+
+ai_tickers = [t for t in ai_tickers if t in common]
+trad_tickers = [t for t in trad_tickers if t in common]
+#only keep tickers that truly exist in daily returns
+
+print(f"Tickers in returns: {len(common)}")
+print(f"AI ETFs: {len(ai_tickers)} | Traditional ETFs: {len(trad_tickers)}")
+
+if len(ai_tickers) == 0 or len(trad_tickers) == 0:
+    raise ValueError("Need at least 1 AI and 1 Traditional ETF. Check your AI flag column.")
+
+#must have both groups or allocation makes no sense
+
+
+
+# BUILD AI/TRAD PORTFOLIO RETURNS (EQUAL-WEIGHT)
+
+print("Building equal-weight AI and Traditional portfolios...")
+
+ret_ai = daily[ai_tickers].mean(axis=1, skipna=True).rename("ret_ai")
+ret_tr = daily[trad_tickers].mean(axis=1, skipna=True).rename("ret_trad")
+
+#Reduce 82(83) ETFs into two daily return series:
+#      an equal-weight AI portfolio
+#      an equal-weight Traditional portfolio
+# So later not allocating among 82 things; allocating between two baskets
+
+
+
+# DOWNLOAD MACRO FEATURES (YAHOO ONLY)
+
+print("Downloading macro features (Yahoo only, Python 3.13 safe)...")
+
+start = daily.index.min().date()
+end   = daily.index.max().date()
+#	use the same date range as our ETF data
+
+# We use proxies available on Yahoo:
+# ^VIX  = volatility (fear)
+# SPY   = market return (S&P 500)
+# ^TNX  = 10Y yield (scaled by 10)
+# ^IRX  = 13-week T-bill yield (short rate, scaled by 100)
+# HYG   = High-yield bond ETF (credit stress proxy via returns)
+tickers = ["^VIX", MARKET_TICKER, "^TNX", "^IRX", "HYG"]
+
+# Download from Yahoo
+raw = yf.download(tickers, start=start, end=end, progress=False, group_by="column", auto_adjust=False)
+
+if raw.empty:
+    raise RuntimeError("Yahoo download returned empty data. Check internet or tickers.")
+
+# yfinance may return:
+# 1 MultiIndex columns: ('Adj Close', 'SPY') etc.
+# 2 Single-level columns for single ticker
+# do bothj
+
+# if multi index, pick price field level safely, Use “Adj Close” if available, else fall back to “Close”
+# Then rename columns to friendly names
+if isinstance(raw.columns, pd.MultiIndex):
+    fields = raw.columns.get_level_values(0).unique().tolist()
+    price_field = "Adj Close" if "Adj Close" in fields else "Close"
+    prices = raw[price_field].copy()
+else:
+    # single ticker case: just use Adj Close if exists, else Close
+    if "Adj Close" in raw.columns:
+        prices = raw[["Adj Close"]].rename(columns={"Adj Close": tickers[0]})
+    elif "Close" in raw.columns:
+        prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
+    else:
+        raise RuntimeError(f"Could not find 'Adj Close' or 'Close' in Yahoo data columns: {list(raw.columns)}")
+
+# now 'prices' should be a DataFrame with columns as tickers (or renamed tickers)
+prices = prices.rename(columns={
+    "^VIX": "VIX",
+    MARKET_TICKER: "SPY",
+    "^TNX": "TNX_10Y",
+    "^IRX": "IRX_3M",
+    "HYG": "HYG",
+})
+
+# ensure expected columns exist (some tickers may fail)
+needed = ["VIX", "SPY", "TNX_10Y", "IRX_3M", "HYG"]
+missing = [c for c in needed if c not in prices.columns]
+if missing:
+    raise RuntimeError(
+        f"Missing expected Yahoo series: {missing}\n"
+        f"Available columns: {list(prices.columns)}\n"
+        "Sometimes Yahoo blocks a ticker temporarily; try rerunning or change proxies."
+    )
+
+
+# SPY daily returns + 20 day compounded return
+spy_ret = prices["SPY"].pct_change()
+spy_ret_20 = (1 + spy_ret).rolling(20).apply(np.prod, raw=True) - 1
+spy_ret_20 = spy_ret_20.rename("sp500_ret_20d")
+#pct_change() gives daily return, rolling product creates compounded 20-day return
+
+# convert yields:
+# TNX is 10x the yield (e.g., 45.2 means 4.52%)
+tnx = (prices["TNX_10Y"] / 10.0).rename("y10")
+
+# IRX is usually already percentish; dividing by 100 makes it decimal
+irx = (prices["IRX_3M"] / 100.0).rename("y3m")
+
+yield_slope = (tnx - irx).rename("yield_slope_10y_3m")
+#slope < 0 means inverted curve (tight conditions)
+
+
+# credit stress proxy: HYG return (more negative on credit stress days): HYG dros - credit stressed
+credit_stress = prices["HYG"].pct_change().rename("credit_stress")
+
+vix = prices["VIX"].rename("VIX")
+
+features = pd.concat([vix, spy_ret_20, yield_slope, credit_stress], axis=1)
+features = features.reindex(daily.index).ffill().dropna()
+
+# reindex to ETF date index.
+# forward fill missing macro days (common because of weekends/holidays)
+# drop early NaNs (especially from rolling 20-day return)
+
+print("Feature sample:")
+print(features.head())
+
+# KMEANS REGIME CLUSTERING
+print(f"Clustering regimes with KMeans (k={N_REGIMES})...")
+
+X = features.values
+Xz = StandardScaler().fit_transform(X)
+#convert features table to a matrix X. standardize each column to mean=0, std=1
+
+kmeans = KMeans(n_clusters=N_REGIMES, random_state=42, n_init=25)
+cluster = kmeans.fit_predict(Xz)
+#fnd 3 clusters in the standardized feature space, then output cluster labels (0/1/2) for each date
+
+reg = pd.Series(cluster, index=features.index, name="cluster") # make it a date indexed series
+
+# Label clusters by avg VIX (low -> calm, high -> crisis)
+cluster_vix = features.groupby(reg)["VIX"].mean().sort_values()
+ordered_clusters = cluster_vix.index.tolist()
+
+
+names = ["calm", "stressed", "crisis"]
+cluster_to_regime = {cl: names[min(i, len(names)-1)] for i, cl in enumerate(ordered_clusters)}
+
+regime = reg.map(cluster_to_regime).rename("regime")
+# convert 0/1/2  to calm/stressed/crisis resp
+print("Cluster -> regime mapping (by avg VIX):")
+for cl in ordered_clusters:
+    print(f"  cluster {cl} | avg VIX={cluster_vix.loc[cl]:.2f} -> {cluster_to_regime[cl]}")
+
+
+
+# PREP BACKTEST DATA (NO LOOKAHEAD)
+
+print("Preparing backtest dataset (shift regime by 1 day to avoid lookahead)...")
+
+df = pd.concat([ret_ai, ret_tr, features, regime], axis=1).dropna()
+#combine everything into one dataset:
+# AI return
+# Traditional returns
+# macro features
+# regime label
+
+df["regime_lag"] = df["regime"].shift(1)
+#we only know today’s regime after seeing today’s macro data
+# so to avoid cheating, we use yesterday’s regime to set today’s portfolio weights
+# that’s what shift(1) does here
+df = df.dropna(subset=["regime_lag"])
+
+
+print("Regime counts (lagged):")
+print(df["regime_lag"].value_counts())
+
+
+# PER-REGIME METRICS: AI vs TRAD
+
+print("\nPer-regime metrics (AI vs Traditional):")
+
+regimes_order = ["calm", "stressed", "crisis"]
+present = [r for r in regimes_order if r in set(df["regime_lag"])]
+# ensures we only evaluate regimes that exist
+
+rows = []
+for r in present:
+    sub = df[df["regime_lag"] == r]
+    for label, series in [("AI", sub["ret_ai"]), ("Traditional", sub["ret_trad"])]:
+        rows.append({
+            "regime": r,
+            "group": label,
+            "mean_daily": series.mean(),
+            "sortino": sortino_ratio(series.values),
+            "cvar_95": cvar(series.values, TAIL_ALPHA),
+        })
+
+metrics_df = pd.DataFrame(rows)
+print(metrics_df)
+
+# we take all days that were classified as regime r:
+# then compute:
+# mean daily return
+# Sortino
+# CVaR95
+# for AI and Traditional
+
+
+
+# OPTIMAL ALLOCATION PER REGIME (MAX SORTINO)
+
+print("\nChoosing optimal AI weight per regime (maximize Sortino)...")
+
+weights = np.round(np.arange(0, 1 + WEIGHT_GRID_STEP, WEIGHT_GRID_STEP), 2)
+# creates a weight list [0.0, 0.1, ..., 1.0]
+alloc = {}
+for r in present:
+    sub = df[df["regime_lag"] == r]
+    best = {"w_ai": None, "sortino": -1e18, "cvar_95": None, "mean_daily": None}
+#for each regime
+    for w in weights:
+        mix = w * sub["ret_ai"].values + (1 - w) * sub["ret_trad"].values #	build mixed returns:
+        s = sortino_ratio(mix) #compute sortino
+        if np.isnan(s):
+            continue
+        if s > best["sortino"]: #keep the best w 
+            best = {
+                "w_ai": float(w),
+                "sortino": float(s),
+                "cvar_95": float(cvar(mix, TAIL_ALPHA)),
+                "mean_daily": float(np.nanmean(mix)),
+            }
+
+    alloc[r] = best
+
+
+for r in present:
+    b = alloc[r]
+    print(f"  {r.upper():8s} -> AI {b['w_ai']:.2f} | Sortino {b['sortino']:.3f} | CVaR95 {b['cvar_95']:.4f}")
+
+      # calm - best AI weight
+    # stressed - best AI weight
+    # crisis - best AI weight
+
+
+# =========================
+# 8) BACKTEST DYNAMIC VS STATIC
+# =========================
+print("\nBacktesting strategy...")
+
+df["w_ai_dyn"] = df["regime_lag"].map(lambda r: alloc[r]["w_ai"])
+df["w_tr_dyn"] = 1 - df["w_ai_dyn"]
+
+df["ret_dyn"] = df["w_ai_dyn"] * df["ret_ai"] + df["w_tr_dyn"] * df["ret_trad"]
+df["ret_static"] = 0.5 * df["ret_ai"] + 0.5 * df["ret_trad"]
+
+turnover_daily = df["w_ai_dyn"].diff().abs().dropna()
+total_turnover = turnover_daily.sum()
+annual_turnover = turnover_daily.mean() * TRADING_DAYS
+
+perf_dyn = perf_summary(df["ret_dyn"].values, "Dynamic Regime Strategy")
+perf_sta = perf_summary(df["ret_static"].values, "Static 50/50 Benchmark")
+
+print("\n=== Performance Summary ===")
+for p in [perf_dyn, perf_sta]:
+    print(f"\n{p['name']}")
+    print(f"  Annual return:   {p['ann_return']:.4f}")
+    print(f"  Annual vol:      {p['ann_vol']:.4f}")
+    print(f"  Sortino:         {p['sortino']:.4f}")
+    print(f"  Max drawdown:    {p['max_drawdown']:.4f}")
+    print(f"  CVaR 95%:        {p['cvar_95']:.4f}")
+
+print("\n=== Turnover (Dynamic) ===")
+print(f"Total turnover (sum |Δw_ai|): {total_turnover:.2f}")
+print(f"Approx annual turnover:       {annual_turnover:.2f}x")
+
+
+# =========================
+# 9) PLOTS
+# =========================
+print("\nPlotting cumulative returns and regime timeline...")
+
+cum_dyn = (1 + df["ret_dyn"]).cumprod()
+cum_sta = (1 + df["ret_static"]).cumprod()
+
+plt.figure(figsize=(10, 5))
+plt.plot(cum_dyn.index, cum_dyn, label="Dynamic")
+plt.plot(cum_sta.index, cum_sta, label="Static 50/50")
+plt.title("Cumulative Growth of $1")
+plt.xlabel("Date")
+plt.ylabel("Value")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+reg_num_map = {"calm": 0, "stressed": 1, "crisis": 2}
+reg_num = df["regime_lag"].map(reg_num_map)
+
+plt.figure(figsize=(10, 2.5))
+plt.plot(reg_num.index, reg_num.values)
+plt.yticks([0, 1, 2], ["calm", "stressed", "crisis"])
+plt.title("Detected Regime Over Time (lagged, no lookahead)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# =========================
+# 10) PRACTICAL INTERPRETATION
+# =========================
+print("\n=== Practical Interpretation ===")
+
+macro_cols = ["VIX", "sp500_ret_20d", "yield_slope_10y_3m", "credit_stress"]
+by_regime = df.groupby("regime_lag")[macro_cols].median().loc[present]
+
+print("\nMedian macro levels by regime (lagged):")
+print(by_regime)
+
+print("\nRule of thumb (heuristic):")
+print(f"- If VIX > {PRACTICAL_VIX_LEVEL:.0f} AND yield slope (10Y-3M) < 0, markets are typically stressed/inverted.")
+print("- In those conditions, your model tends to shift toward the regime(s) with higher AI weight.")
+
+print("\nYour learned regime allocations:")
+for r in present:
+    print(f"  {r.upper():8s}: AI {alloc[r]['w_ai']:.0%} / Traditional {1-alloc[r]['w_ai']:.0%}")
+
+print("\nDone.")
