@@ -400,21 +400,88 @@ for r in present:
 
 
 # BACKTEST DYNAMIC VS STATIC
-print("\nBacktesting strategy...")
+print("\nBacktesting strategy ...")
 
-df["w_ai_dyn"] = df["regime_lag"].map(lambda r: alloc[r]["w_ai"])
+#  knobs to reduce turnover 
+N_ENTER = 2          # require 2 consecutive crisis days to ENTER
+N_EXIT  = 7          # require 7 consecutive non crisis days to EXIT (stickier)
+WEEKLY_REBAL = True  # trade only weekly
+MAX_STEP = 0.20      # max change in AI weight per rebalance (20% per trade)
+
+# 1) Target weight from regime
+df["w_ai_target"] = df["regime_lag"].map(lambda r: alloc[r]["w_ai"])
+
+# 2) Crisis vs non crisis signal (because only crisis differs in the alloc)
+is_crisis = (df["regime_lag"] == "crisis").astype(int)
+
+# 3) Debounce / sticky regime switching
+# Enter crisis only after N_ENTER consecutive crisis days.
+# Exit crisis only after N_EXIT consecutive non crisis days.
+crisis_run = is_crisis.groupby((is_crisis != is_crisis.shift()).cumsum()).cumcount() + 1
+noncrisis_run = (1 - is_crisis).groupby(((1 - is_crisis) != (1 - is_crisis).shift()).cumsum()).cumcount() + 1
+
+state = []
+in_crisis = False
+for i in range(len(df)):
+    if not in_crisis:
+        # can enter?
+        if is_crisis.iat[i] == 1 and crisis_run.iat[i] >= N_ENTER:
+            in_crisis = True
+    else:
+        # can exit?
+        if is_crisis.iat[i] == 0 and noncrisis_run.iat[i] >= N_EXIT:
+            in_crisis = False
+    state.append(in_crisis)
+
+df["crisis_smooth"] = pd.Series(state, index=df.index)
+
+# Converts smoothed crisis state into a smoothed target weight:
+# if crisis_smooth => use the crisis allocation
+# else => use the best non crisis allocation (usually calm/stressed, so 0)
+w_crisis = alloc["crisis"]["w_ai"] if "crisis" in alloc else 0.0
+# pick "stressed" if present else "calm" else 0
+noncr = "stressed" if "stressed" in alloc else ("calm" if "calm" in alloc else None)
+w_noncrisis = alloc[noncr]["w_ai"] if noncr else 0.0
+
+df["w_ai_smooth_target"] = np.where(df["crisis_smooth"], w_crisis, w_noncrisis)
+
+# 4) Weekly rebalancing: only allow weight updates on Fridays (weekday=4)
+if WEEKLY_REBAL:
+    rebalance_day = (df.index.weekday == 4)  # Fri
+else:
+    rebalance_day = np.ones(len(df), dtype=bool)
+ 
+ 
+# 5) Max-step limiter + rebalance schedule
+w = np.zeros(len(df), dtype=float)
+w[0] = df["w_ai_smooth_target"].iat[0]
+
+for t in range(1, len(df)):
+    w_prev = w[t-1]
+
+    if rebalance_day[t]:
+        target = float(df["w_ai_smooth_target"].iat[t])
+        delta = target - w_prev
+        # limit how much we can change in one rebalance
+        delta_limited = np.clip(delta, -MAX_STEP, MAX_STEP)
+        w[t] = w_prev + delta_limited
+    else:
+        # hold weight between rebalances
+        w[t] = w_prev
+
+df["w_ai_dyn"] = w
 df["w_tr_dyn"] = 1 - df["w_ai_dyn"]
 
+# returns
 df["ret_dyn"] = df["w_ai_dyn"] * df["ret_ai"] + df["w_tr_dyn"] * df["ret_trad"]
 df["ret_static"] = 0.5 * df["ret_ai"] + 0.5 * df["ret_trad"]
 
-turnover_daily = df["w_ai_dyn"].diff().abs().dropna() #Daily turnover= |today weight − yesterday weight|
-total_turnover = turnover_daily.sum() #total turnover over all history
-annual_turnover = turnover_daily.mean() * TRADING_DAYS #average annual turnover
+# turnover
+turnover_daily = df["w_ai_dyn"].diff().abs().dropna()
+total_turnover = turnover_daily.sum()
+annual_turnover = turnover_daily.mean() * TRADING_DAYS
 
-# Higher turnover = more trading = more transaction cost impact
-
-perf_dyn = perf_summary(df["ret_dyn"].values, "Dynamic Regime Strategy")
+perf_dyn = perf_summary(df["ret_dyn"].values, "Dynamic Regime Strategy (Turnover-Reduced)")
 perf_sta = perf_summary(df["ret_static"].values, "Static 50/50 Benchmark")
 
 print("\n=== Performance Summary ===")
@@ -429,15 +496,6 @@ for p in [perf_dyn, perf_sta]:
 print("\n=== Turnover (Dynamic) ===")
 print(f"Total turnover (sum |Δw_ai|): {total_turnover:.2f}")
 print(f"Approx annual turnover:       {annual_turnover:.2f}x")
-
-# we use perf_summary() which includes:
-	#   annual return
-	#	annual vol
-	#	Sortino
-	#	max drawdown
-	#	CVaR95
-
-# it prints both dynamic and static for compaerison 
 
 
 # PLOTS
