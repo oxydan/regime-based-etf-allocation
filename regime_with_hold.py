@@ -13,7 +13,7 @@ import yfinance as yf
 INTERACTIVE_MODE = True
 SHOW_PLOTS = False   # we don't want graphs at this point, so we skip them
 
-DATA_PATH = "ai_etf_downside_risk_data_full.xlsx"
+DATA_PATH = "ai_etf_downside_risk_data.xlsx"
 
 N_REGIMES = 3                      # calm / stressed / crisis
 TAIL_ALPHA = 0.95                  # CVaR at 95%: average loss on the worst 5% days
