@@ -513,6 +513,19 @@ def _last_20d_compounded(series):
         return np.nan
     return (1.0 + s.tail(20)).prod() - 1.0
 
+def get_inception_date_from_returns(ticker: str) -> str:
+    """
+    Inception date = first date where this ticker has a non-NaN value in the Excel returns sheet.
+    Returns ISO string (YYYY-MM-DD) or 'n/a' if not found.
+    """
+    t = str(ticker).strip().upper()
+    if t not in daily.columns:
+        return "n/a"
+    first_idx = daily[t].first_valid_index()
+    if first_idx is None:
+        return "n/a"
+    return str(pd.to_datetime(first_idx).date())
+
 def suggest_action_for_ticker(ticker: str):
     t = str(ticker).strip().upper() # normalize user input
 
@@ -525,6 +538,19 @@ def suggest_action_for_ticker(ticker: str):
 
     # group membership
     group = "AI" if t in ai_tickers else "Traditional"
+
+    # Inception date from Excel (first non-NaN return)
+    inception_date = get_inception_date_from_returns(t)
+
+# Optional: pull extra metadata from Fund_Summary if available (safe if columns don't exist)
+    fund_row = funds.loc[funds[ticker_col].str.upper() == t]
+    fund_info = {}
+    if len(fund_row) > 0:
+        fund_row = fund_row.iloc[0]
+    # add any columns you might have in the sheet (these are optional)
+        for col_name in ["Fund_Name", "Name", "Provider", "Issuer", "Category", "Asset_Class"]:
+            if col_name in funds.columns:
+                fund_info[col_name] = fund_row.get(col_name)
 
     # latest state of model
     latest_date = df.index[-1]
@@ -597,6 +623,8 @@ def suggest_action_for_ticker(ticker: str):
         "ok": True,
         "ticker": t,
         "group": group,
+        "inception_date": inception_date,
+        "fund_info": fund_info,
         "date": str(latest_date.date()),
         "regime_lag": latest_regime_lag,
         "w_ai_now": w_ai_now,
@@ -658,12 +686,20 @@ def interactive_signal_loop():
             continue
 
         print("\n--------------------------------")
-        print(f"Ticker:     {out['ticker']}   | Group: {out['group']}")
+        print(f"Ticker:     {out['ticker']}   | Group: {out['group']} | Inception (Excel): {out['inception_date']}")
         print(f"Date:       {out['date']}     | Regime (lagged): {out['regime_lag']}")
+        if out.get("fund_info"):
+    # print a compact one-liner from whatever exists
+            parts = []
+            for k, v in out["fund_info"].items():
+                if pd.notna(v):
+                    parts.append(f"{k}: {v}")
+            if parts:
+                print("Info:       " + " | ".join(parts))
         print(f"Model w_AI:  {out['w_ai_prev']:.2f} -> {out['w_ai_now']:.2f}  (Δ {out['delta_w']:+.2f}, {out['strength']})")
         print(f"Rotation:   {out['rotation']}")
         print(f"Signal:     {out['final_signal']}  (base: {out['base_signal']})")
-        print(f"Momentum20: {out['momentum_20d_note']}")
+        print(f"Momentum20: {out['momentum_20d_note']}")VUG
         print("--------------------------------\n")
 
 
