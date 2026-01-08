@@ -504,6 +504,27 @@ print("\n=== Turnover (Dynamic) ===")
 print(f"Total turnover (sum |Δw_ai|): {total_turnover:.2f}")
 print(f"Approx annual turnover:       {annual_turnover:.2f}x")
 
+# SAVE RESULTS FOR PLOTTING (easier this way for me)
+
+import pickle
+
+results = {
+    "df": df,
+    "alloc": alloc,
+    "metrics_df": metrics_df,
+    "ai_tickers": ai_tickers,
+    "trad_tickers": trad_tickers,
+    "TRADING_DAYS": TRADING_DAYS,
+    "TAIL_ALPHA": TAIL_ALPHA,
+    "N_REGIMES": N_REGIMES,
+    "PRACTICAL_VIX_LEVEL": PRACTICAL_VIX_LEVEL,
+}
+
+with open("regime_results.pkl", "wb") as f:
+    pickle.dump(results, f)
+
+print("\nSaved: regime_results.pkl")
+
 # BUY / HOLD / SELL for an ETF ticker
 
 # helper: compute compounded return over last 20 days
@@ -699,7 +720,7 @@ def interactive_signal_loop():
         print(f"Model w_AI:  {out['w_ai_prev']:.2f} -> {out['w_ai_now']:.2f}  (Δ {out['delta_w']:+.2f}, {out['strength']})")
         print(f"Rotation:   {out['rotation']}")
         print(f"Signal:     {out['final_signal']}  (base: {out['base_signal']})")
-        print(f"Momentum20: {out['momentum_20d_note']}")VUG
+        print(f"Momentum20: {out['momentum_20d_note']}")
         print("--------------------------------\n")
 
 
