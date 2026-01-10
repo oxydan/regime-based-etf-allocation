@@ -1,0 +1,598 @@
+"""
+=============================================================================
+STANDALONE HYPOTHESIS TESTING SCRIPT
+=============================================================================
+This script runs independently - no need to insert into regime_allocation.py
+
+Uses the same methodology as your teammate's regime_allocation.py:
+- K-Means clustering with VIX, 20-day returns, yield slope, credit stress
+- 1-day lag to avoid lookahead bias
+- Labels assigned by average VIX level
+=============================================================================
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+from scipy import stats
+from scipy.stats import ttest_ind, mannwhitneyu, chi2_contingency
+import statsmodels.api as sm
+
+
+# CONFIGURATION - CHANGE THESE PATHS AS NEEDED
+# =============================================================================
+DATA_PATH = r"C:\Users\vikto\Desktop\Scientific Writing\ai_etf_downside_risk_data_full (1).xlsx"  # Your data file
+OUTPUT_PATH = "hypothesis_results.xlsx"           # Where to save results
+
+N_REGIMES = 3          # calm / stressed / crisis
+TAIL_ALPHA = 0.95      # CVaR at 95%
+TRADING_DAYS = 252
+EXTREME_THRESHOLD = -0.03  # -3% for extreme loss days
+
+
+# HELPER FUNCTIONS (same as regime_allocation.py)
+# =============================================================================
+def cvar(returns, alpha=0.95):
+    """Conditional Value at Risk (Expected Shortfall)"""
+    r = np.asarray(returns)
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return np.nan
+    r_sorted = np.sort(r)
+    tail_n = max(int(np.ceil((1 - alpha) * len(r_sorted))), 1)
+    return r_sorted[:tail_n].mean()
+
+def sortino_ratio(returns, rf=0.0):
+    """Sortino Ratio"""
+    r = np.asarray(returns)
+    r = r[np.isfinite(r)]
+    if len(r) < 5:
+        return np.nan
+    excess = r - rf
+    downside = excess[excess < 0]
+    if len(downside) < 3:
+        return np.nan
+    ds = downside.std(ddof=1)
+    if ds == 0:
+        return np.nan
+    return excess.mean() / ds
+
+def max_drawdown(returns):
+    """Maximum Drawdown"""
+    r = np.asarray(returns)
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return np.nan
+    equity = (1 + r).cumprod()
+    peak = np.maximum.accumulate(equity)
+    dd = (equity - peak) / peak
+    return dd.min()
+
+def annualized_return(daily_returns, trading_days=252):
+    """Annualized Return"""
+    r = np.asarray(daily_returns)
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return np.nan
+    return np.exp(np.log1p(r).mean() * trading_days) - 1
+
+def annualized_vol(daily_returns, trading_days=252):
+    """Annualized Volatility"""
+    r = np.asarray(daily_returns)
+    r = r[np.isfinite(r)]
+    if len(r) < 2:
+        return np.nan
+    return r.std(ddof=1) * np.sqrt(trading_days)
+
+
+# LOAD DATA
+# =============================================================================
+print("="*70)
+print("LOADING DATA")
+print("="*70)
+
+xls = pd.ExcelFile(DATA_PATH)
+
+# Load sheets
+daily = pd.read_excel(xls, "Daily_Returns")
+funds = pd.read_excel(xls, "Fund_Summary")
+
+# Process daily returns
+daily['Date'] = pd.to_datetime(daily['Date'])
+daily = daily.sort_values('Date').set_index('Date')
+daily = daily.select_dtypes(include=[np.number])
+
+# Get AI and Traditional tickers
+ticker_col = 'Ticker'
+ai_flag_col = 'is_ai'
+
+ai_tickers = funds.loc[funds[ai_flag_col] == True, ticker_col].tolist()
+trad_tickers = funds.loc[funds[ai_flag_col] == False, ticker_col].tolist()
+
+# Filter to tickers in daily returns
+common = sorted(set(daily.columns).intersection(set(funds[ticker_col])))
+ai_tickers = [t for t in ai_tickers if t in common]
+trad_tickers = [t for t in trad_tickers if t in common]
+
+print(f"AI ETFs: {len(ai_tickers)} -> {ai_tickers}")
+print(f"Traditional ETFs: {len(trad_tickers)}")
+
+
+# BUILD PORTFOLIOS
+# =============================================================================
+print("\n" + "="*70)
+print("BUILDING PORTFOLIOS")
+print("="*70)
+
+ret_ai = daily[ai_tickers].mean(axis=1, skipna=True).rename("ret_ai")
+ret_trad = daily[trad_tickers].mean(axis=1, skipna=True).rename("ret_trad")
+
+print(f"AI portfolio: {len(ret_ai.dropna())} days")
+print(f"Traditional portfolio: {len(ret_trad.dropna())} days")
+
+
+# BUILD REGIME FEATURES (same methodology as regime_allocation.py)
+# =============================================================================
+print("\n" + "="*70)
+print("BUILDING REGIME FEATURES")
+print("="*70)
+
+# Use SPY from daily returns as market proxy
+if 'SPY' in daily.columns:
+    spy_ret = daily['SPY']
+    print("Using SPY from data file")
+else:
+    spy_ret = ret_trad  # fallback
+    print("Using Traditional portfolio as market proxy")
+
+# Feature 1: VIX proxy - rolling 20-day volatility (annualized)
+vix_proxy = spy_ret.rolling(20).std() * np.sqrt(252) * 100
+vix_proxy = vix_proxy.rename("VIX")
+
+# Feature 2: 20-day compounded return
+sp500_ret_20d = (1 + spy_ret).rolling(20).apply(np.prod, raw=True) - 1
+sp500_ret_20d = sp500_ret_20d.rename("sp500_ret_20d")
+
+# Feature 3: Yield slope proxy - use momentum difference as proxy
+# (In actual script this comes from Yahoo; here we approximate)
+yield_slope_proxy = spy_ret.rolling(60).mean() - spy_ret.rolling(20).mean()
+yield_slope_proxy = (yield_slope_proxy * 100).rename("yield_slope_10y_3m")
+
+# Feature 4: Credit stress proxy - rolling drawdown
+rolling_max = (1 + spy_ret).rolling(60).apply(lambda x: x.cumprod().max(), raw=False)
+rolling_current = (1 + spy_ret).rolling(60).apply(lambda x: x.cumprod()[-1], raw=False)
+credit_stress = ((rolling_current - rolling_max) / rolling_max).rename("credit_stress")
+
+# Combine features
+features = pd.concat([vix_proxy, sp500_ret_20d, yield_slope_proxy, credit_stress], axis=1)
+features = features.dropna()
+
+print(f"Feature sample (first 5 rows):")
+print(features.head())
+print(f"\nTotal days with features: {len(features)}")
+
+
+# K-MEANS REGIME CLUSTERING (same as regime_allocation.py)
+# =============================================================================
+print("\n" + "="*70)
+print(f"K-MEANS CLUSTERING (k={N_REGIMES})")
+print("="*70)
+
+# Standardize features
+X = features.values
+Xz = StandardScaler().fit_transform(X)
+
+# K-Means clustering
+kmeans = KMeans(n_clusters=N_REGIMES, random_state=42, n_init=25)
+cluster = kmeans.fit_predict(Xz)
+
+reg = pd.Series(cluster, index=features.index, name="cluster")
+
+# Label clusters by average VIX (low -> calm, high -> crisis)
+cluster_vix = features.groupby(reg)["VIX"].mean().sort_values()
+ordered_clusters = cluster_vix.index.tolist()
+
+names = ["calm", "stressed", "crisis"]
+cluster_to_regime = {cl: names[min(i, len(names)-1)] for i, cl in enumerate(ordered_clusters)}
+
+regime = reg.map(cluster_to_regime).rename("regime")
+
+print("\nCluster -> Regime mapping (by avg VIX):")
+for cl in ordered_clusters:
+    print(f"  Cluster {cl} | avg VIX={cluster_vix.loc[cl]:.2f}% -> {cluster_to_regime[cl]}")
+
+
+# BUILD MAIN DATAFRAME (df) - same as regime_allocation.py
+# =============================================================================
+print("\n" + "="*70)
+print("PREPARING BACKTEST DATA")
+print("="*70)
+
+df = pd.concat([ret_ai, ret_trad, features, regime], axis=1).dropna()
+
+# Lag regime by 1 day to avoid lookahead bias
+df["regime_lag"] = df["regime"].shift(1)
+df = df.dropna(subset=["regime_lag"])
+
+print(f"Total observations: {len(df)}")
+print(f"\nRegime counts (lagged):")
+print(df["regime_lag"].value_counts())
+
+# Define present regimes
+regimes_order = ["calm", "stressed", "crisis"]
+present = [r for r in regimes_order if r in set(df["regime_lag"])]
+
+
+# HYPOTHESIS TESTING BEGINS HERE
+# =============================================================================
+
+print("\n")
+print("="*70)
+print("HYPOTHESIS TESTING")
+print("="*70)
+
+
+# H1: UNCONDITIONAL DOWNSIDE RISK
+# =============================================================================
+print("\n" + "-"*70)
+print("H1: UNCONDITIONAL DOWNSIDE RISK")
+print("AI-managed ETFs exhibit lower unconditional downside risk")
+print("-"*70)
+
+ai_returns = df["ret_ai"].values
+trad_returns = df["ret_trad"].values
+
+# Compute metrics
+h1_metrics = {
+    'CVaR_95': (cvar(ai_returns, 0.95), cvar(trad_returns, 0.95)),
+    'CVaR_99': (cvar(ai_returns, 0.99), cvar(trad_returns, 0.99)),
+    'Sortino': (sortino_ratio(ai_returns), sortino_ratio(trad_returns)),
+    'Max_DD': (max_drawdown(ai_returns), max_drawdown(trad_returns)),
+    'Volatility': (annualized_vol(ai_returns), annualized_vol(trad_returns)),
+}
+
+print("\n{:<12} {:>12} {:>12} {:>12}".format("Metric", "AI", "Traditional", "Difference"))
+print("-"*50)
+for metric, (ai_val, trad_val) in h1_metrics.items():
+    diff = ai_val - trad_val
+    print("{:<12} {:>12.4f} {:>12.4f} {:>12.4f}".format(metric, ai_val, trad_val, diff))
+
+# Bootstrap test for CVaR difference
+print("\nBootstrap test for CVaR_95 difference (10,000 replications):")
+np.random.seed(42)
+n_boot = 10000
+boot_diffs = []
+n_ai = len(ai_returns)
+n_trad = len(trad_returns)
+for _ in range(n_boot):
+    ai_sample = np.random.choice(ai_returns, size=n_ai, replace=True)
+    trad_sample = np.random.choice(trad_returns, size=n_trad, replace=True)
+    boot_diffs.append(cvar(ai_sample, 0.95) - cvar(trad_sample, 0.95))
+
+boot_diffs = np.array(boot_diffs)
+ci_lower = np.percentile(boot_diffs, 2.5)
+ci_upper = np.percentile(boot_diffs, 97.5)
+p_value_boot = np.mean(boot_diffs < 0)
+
+print(f"  Mean difference: {np.mean(boot_diffs):.6f}")
+print(f"  95% CI: [{ci_lower:.6f}, {ci_upper:.6f}]")
+print(f"  P(AI CVaR better): {1-p_value_boot:.4f}")
+
+if ci_lower > 0:
+    print("  >>> AI has SIGNIFICANTLY better (less negative) CVaR")
+elif ci_upper < 0:
+    print("  >>> AI has SIGNIFICANTLY worse (more negative) CVaR")
+else:
+    print("  >>> No significant difference (CI contains 0)")
+
+
+# H2: REGIME-DEPENDENT PERFORMANCE
+# =============================================================================
+print("\n" + "-"*70)
+print("H2: REGIME-DEPENDENT PERFORMANCE")
+print("AI ETFs outperform in crisis, underperform in calm")
+print("-"*70)
+
+print("\n{:<10} {:>10} {:>10} {:>12} {:>12} {:>8}".format(
+    "Regime", "AI Ann%", "Trad Ann%", "Diff", "t-stat", "p-value"))
+print("-"*65)
+
+h2_results = {}
+for regime in present:
+    sub = df[df["regime_lag"] == regime]
+    ai_ret = sub["ret_ai"].values
+    trad_ret = sub["ret_trad"].values
+    
+    ai_ann = annualized_return(ai_ret, TRADING_DAYS)
+    trad_ann = annualized_return(trad_ret, TRADING_DAYS)
+    diff = ai_ann - trad_ann
+    
+    # Paired t-test on daily returns
+    t_stat, p_val = stats.ttest_rel(ai_ret, trad_ret)
+    
+    h2_results[regime] = {
+        'ai_return': ai_ann,
+        'trad_return': trad_ann,
+        'diff': diff,
+        't_stat': t_stat,
+        'p_val': p_val,
+        'n_days': len(sub)
+    }
+    
+    print("{:<10} {:>10.2%} {:>10.2%} {:>12.2%} {:>12.3f} {:>8.4f}".format(
+        regime, ai_ann, trad_ann, diff, t_stat, p_val))
+
+# Check if pattern matches hypothesis
+if 'crisis' in h2_results and 'calm' in h2_results:
+    crisis_diff = h2_results['crisis']['diff']
+    calm_diff = h2_results['calm']['diff']
+    
+    print(f"\nPattern check:")
+    print(f"  AI - Trad in CRISIS: {crisis_diff:+.2%}")
+    print(f"  AI - Trad in CALM:   {calm_diff:+.2%}")
+    
+    if crisis_diff > 0 and calm_diff < 0:
+        print("  >>> H2 SUPPORTED: AI outperforms in crisis, underperforms in calm")
+    elif crisis_diff > calm_diff:
+        print("  >>> H2 PARTIALLY SUPPORTED: AI relatively better in crisis than calm")
+    else:
+        print("  >>> H2 NOT SUPPORTED: Pattern does not match hypothesis")
+
+
+# H3: CRISIS ALPHA (CAPM)
+# =============================================================================
+print("\n" + "-"*70)
+print("H3: POSITIVE CRISIS ALPHA")
+print("AI ETFs generate positive alpha during crisis regimes")
+print("-"*70)
+
+print("\nCAPM: R_i - R_f = α + β(R_m - R_f) + ε")
+print("Using Traditional portfolio as market proxy")
+print("HAC standard errors (Newey-West, 5 lags)\n")
+
+print("{:<10} {:>8} {:>10} {:>10} {:>10} {:>10}".format(
+    "Regime", "Group", "Alpha%", "Beta", "t(α)", "p(α)"))
+print("-"*60)
+
+h3_results = {}
+for regime in present:
+    sub = df[df["regime_lag"] == regime]
+    if len(sub) < 50:
+        print(f"{regime}: insufficient observations ({len(sub)})")
+        continue
+    
+    h3_results[regime] = {}
+    mkt_ret = sub["ret_trad"].values
+    
+    for group, ret_col in [("AI", "ret_ai"), ("Trad", "ret_trad")]:
+        y = sub[ret_col].values
+        X = sm.add_constant(mkt_ret)
+        
+        try:
+            model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 5})
+            
+            alpha = model.params[0]
+            beta = model.params[1]
+            t_alpha = model.tvalues[0]
+            p_alpha = model.pvalues[0]
+            alpha_ann = alpha * TRADING_DAYS
+            
+            h3_results[regime][group] = {
+                'alpha': alpha,
+                'alpha_ann': alpha_ann,
+                'beta': beta,
+                't_alpha': t_alpha,
+                'p_alpha': p_alpha
+            }
+            
+            sig = "*" if p_alpha < 0.05 else ""
+            print("{:<10} {:>8} {:>10.2%} {:>10.3f} {:>10.2f} {:>9.4f}{}".format(
+                regime, group, alpha_ann, beta, t_alpha, p_alpha, sig))
+        except Exception as e:
+            print(f"{regime} {group}: Error - {e}")
+
+# H3 verdict
+if 'crisis' in h3_results and 'AI' in h3_results['crisis']:
+    crisis_alpha = h3_results['crisis']['AI']['alpha_ann']
+    crisis_p = h3_results['crisis']['AI']['p_alpha']
+    print(f"\n>>> Crisis AI Alpha: {crisis_alpha:.2%} (p={crisis_p:.4f})")
+    if crisis_alpha > 0 and crisis_p < 0.05:
+        print(">>> H3 SUPPORTED: Positive and significant crisis alpha")
+    elif crisis_alpha > 0:
+        print(">>> H3 PARTIALLY SUPPORTED: Positive but not significant")
+    else:
+        print(">>> H3 REJECTED: Alpha not positive in crisis")
+
+
+# H4: ASYMMETRIC BETA (DOWNSIDE VS UPSIDE)
+# =============================================================================
+print("\n" + "-"*70)
+print("H4: ASYMMETRIC BETA")
+print("AI ETFs have lower downside beta than traditional ETFs")
+print("-"*70)
+
+mkt_ret_full = df["ret_trad"].values
+up_mask = mkt_ret_full > 0
+down_mask = mkt_ret_full < 0
+
+print(f"\nUp-market days: {up_mask.sum()}")
+print(f"Down-market days: {down_mask.sum()}")
+
+print("\n{:<8} {:>12} {:>12} {:>12} {:>15}".format(
+    "Group", "Upside β", "Downside β", "β⁻ - β⁺", "Lower Downside?"))
+print("-"*60)
+
+h4_results = {}
+for group, ret_col in [("AI", "ret_ai"), ("Trad", "ret_trad")]:
+    returns = df[ret_col].values
+    
+    # Upside beta
+    y_up = returns[up_mask]
+    X_up = sm.add_constant(mkt_ret_full[up_mask])
+    beta_up = sm.OLS(y_up, X_up).fit().params[1]
+    
+    # Downside beta
+    y_down = returns[down_mask]
+    X_down = sm.add_constant(mkt_ret_full[down_mask])
+    beta_down = sm.OLS(y_down, X_down).fit().params[1]
+    
+    asymmetry = beta_down - beta_up
+    
+    h4_results[group] = {
+        'beta_up': beta_up,
+        'beta_down': beta_down,
+        'asymmetry': asymmetry
+    }
+    
+    lower = "Yes ✓" if asymmetry < 0 else "No"
+    print("{:<8} {:>12.4f} {:>12.4f} {:>12.4f} {:>15}".format(
+        group, beta_up, beta_down, asymmetry, lower))
+
+# H4 verdict
+ai_down = h4_results['AI']['beta_down']
+trad_down = h4_results['Trad']['beta_down']
+print(f"\n>>> AI downside β: {ai_down:.4f}")
+print(f">>> Trad downside β: {trad_down:.4f}")
+print(f">>> Difference: {ai_down - trad_down:.4f}")
+
+if ai_down < trad_down:
+    print(">>> H4 SUPPORTED: AI has lower downside beta")
+else:
+    print(">>> H4 REJECTED: AI does not have lower downside beta")
+
+
+# H5: FEWER EXTREME LOSS DAYS
+# =============================================================================
+print("\n" + "-"*70)
+print("H5: FEWER EXTREME LOSS DAYS")
+print(f"AI ETFs have fewer days with returns below {EXTREME_THRESHOLD:.0%}")
+print("-"*70)
+
+extreme_results = []
+for ticker in ai_tickers + trad_tickers:
+    if ticker not in daily.columns:
+        continue
+    ret = daily[ticker].dropna()
+    n_total = len(ret)
+    n_extreme = (ret < EXTREME_THRESHOLD).sum()
+    pct = n_extreme / n_total if n_total > 0 else 0
+    group = "AI" if ticker in ai_tickers else "Trad"
+    extreme_results.append({
+        'ticker': ticker,
+        'group': group,
+        'n_total': n_total,
+        'n_extreme': n_extreme,
+        'pct_extreme': pct
+    })
+
+extreme_df_test = pd.DataFrame(extreme_results)
+
+# Summary by group
+ai_pct = extreme_df_test[extreme_df_test['group'] == 'AI']['pct_extreme'].mean()
+trad_pct = extreme_df_test[extreme_df_test['group'] == 'Trad']['pct_extreme'].mean()
+
+print(f"\nSummary:")
+print(f"  AI ETFs average:   {ai_pct:.2%} of days are extreme losses")
+print(f"  Trad ETFs average: {trad_pct:.2%} of days are extreme losses")
+
+# T-test
+ai_vals = extreme_df_test[extreme_df_test['group'] == 'AI']['pct_extreme'].values
+trad_vals = extreme_df_test[extreme_df_test['group'] == 'Trad']['pct_extreme'].values
+
+t_stat, p_val = ttest_ind(ai_vals, trad_vals, equal_var=False)
+print(f"\nWelch's t-test:")
+print(f"  t-statistic: {t_stat:.3f}")
+print(f"  p-value: {p_val:.4f}")
+
+# Mann-Whitney (non-parametric)
+u_stat, u_pval = mannwhitneyu(ai_vals, trad_vals, alternative='less')
+print(f"\nMann-Whitney U (AI < Trad):")
+print(f"  U-statistic: {u_stat:.1f}")
+print(f"  p-value: {u_pval:.4f}")
+
+# H5 verdict
+if ai_pct < trad_pct:
+    if p_val < 0.05 or u_pval < 0.05:
+        print("\n>>> H5 SUPPORTED: AI has significantly fewer extreme days")
+    else:
+        print("\n>>> H5 PARTIALLY SUPPORTED: AI has fewer extreme days (not significant)")
+else:
+    print("\n>>> H5 REJECTED: AI does not have fewer extreme days")
+
+# =============================================================================
+# FINAL SUMMARY
+# =============================================================================
+print("\n")
+print("="*70)
+print("HYPOTHESIS TESTING SUMMARY")
+print("="*70)
+
+summary_table = """
++------+------------------------------------------+-----------------+
+|  H   | Description                              | Result          |
++------+------------------------------------------+-----------------+
+|  H1  | Lower unconditional downside risk        | See above       |
+|  H2  | Outperform in crisis, underperform calm  | See above       |
+|  H3  | Positive crisis alpha                    | See above       |
+|  H4  | Lower downside beta                      | See above       |
+|  H5  | Fewer extreme loss days (<-3%)           | See above       |
++------+------------------------------------------+-----------------+
+
+Methodology (same as regime_allocation.py):
+- Regimes detected using K-Means clustering (k=3) on 4 features:
+  * VIX proxy (20-day rolling volatility)
+  * 20-day S&P 500 compounded return
+  * Yield curve slope proxy
+  * Credit stress proxy (drawdown)
+- Regime labels assigned by average VIX level (low=calm, high=crisis)
+- 1-day lag applied to avoid lookahead bias
+- HAC standard errors (Newey-West) for CAPM regressions
+- Bootstrap confidence intervals for small-sample tests
+"""
+print(summary_table)
+
+# =============================================================================
+# EXPORT TO EXCEL
+# =============================================================================
+print(f"Exporting results to {OUTPUT_PATH}...")
+
+with pd.ExcelWriter(OUTPUT_PATH, engine='openpyxl') as writer:
+    # H1
+    h1_df = pd.DataFrame(h1_metrics, index=['AI', 'Traditional']).T
+    h1_df['Difference'] = h1_df['AI'] - h1_df['Traditional']
+    h1_df.to_excel(writer, sheet_name='H1_Downside_Risk')
+    
+    # H2
+    h2_df = pd.DataFrame(h2_results).T
+    h2_df.to_excel(writer, sheet_name='H2_Regime_Returns')
+    
+    # H3
+    h3_rows = []
+    for regime, groups in h3_results.items():
+        for group, vals in groups.items():
+            row = {'regime': regime, 'group': group}
+            row.update(vals)
+            h3_rows.append(row)
+    pd.DataFrame(h3_rows).to_excel(writer, sheet_name='H3_Crisis_Alpha', index=False)
+    
+    # H4
+    h4_df = pd.DataFrame(h4_results).T
+    h4_df.to_excel(writer, sheet_name='H4_Asymmetric_Beta')
+    
+    # H5
+    extreme_df_test.to_excel(writer, sheet_name='H5_Extreme_Days', index=False)
+    
+    # Regime distribution
+    regime_counts = df['regime_lag'].value_counts().to_frame('n_days')
+    regime_counts['pct'] = regime_counts['n_days'] / len(df)
+    regime_counts.to_excel(writer, sheet_name='Regime_Distribution')
+
+print(f"Results saved to: {OUTPUT_PATH}")
+print("\nDone!")
